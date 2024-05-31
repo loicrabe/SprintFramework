@@ -1,78 +1,73 @@
 package mg.p16.Spring;
 
-import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
-import java.net.URL;
-import java.net.URLDecoder;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 
-import jakarta.servlet.*;
-import jakarta.servlet.http.*;
-import mg.annotation.AnnotationController;
+public class FrontServlet extends HttpServlet {
+    private String controllerPackage;
+    private Map<String, Mapping> urlMappings;
+    private Map<String, Mapping> unannotatedMethods;
 
-public class FrontController extends HttpServlet{
-    boolean checked = false;
-    List<Class<?>> ls;
-
+    @Override
     public void init() throws ServletException {
-        super.init();
-        scan();
-    }
-
-    private void scan(){
-        if (!checked) {
-            String pack = this.getInitParameter("controllerPackage");
-            try {
-                ls = getClassesInPackage(pack);
-                checked = true;
-            } catch (Exception e) {
-                e.printStackTrace();
-                ls = new ArrayList<>();
-            }
-        }
-    }
-
-    private List<Class<?>> getClassesInPackage(String packageName) throws IOException, ClassNotFoundException {
-        List<Class<?>> classes = new ArrayList<>();
-        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
-        String path = packageName.replace('.', '/');
-
-        Enumeration<URL> resources = classLoader.getResources(path);
-        while (resources.hasMoreElements()) {
-            URL resource = resources.nextElement();
-            if (resource.getProtocol().equals("file")) {
-                File directory = new File(URLDecoder.decode(resource.getFile(), "UTF-8"));
-                if (directory.exists() && directory.isDirectory()) {
-                    File[] files = directory.listFiles();
-                    for (File file : files) {
-                        if (file.isFile() && file.getName().endsWith(".class")) {
-                            String className = packageName + '.' + file.getName().substring(0, file.getName().length() - 6);
-                            Class<?> clazz = Class.forName(className);
-                            if (clazz.isAnnotationPresent(AnnotationController.class)) {
-                                classes.add(clazz);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return classes;
+        this.controllerPackage = getServletConfig().getInitParameter("controller-package");
+        this.urlMappings = new HashMap<>();
+        this.unannotatedMethods = new HashMap<>();
+        scanControllersAndMapUrls(this.controllerPackage);
     }
 
     protected void processRequest(HttpServletRequest request, HttpServletResponse response)
             throws ServletException, IOException {
-        response.setContentType("text/plain");
+        response.setContentType("text/html;charset=UTF-8");
         try (PrintWriter out = response.getWriter()) {
-            // out.println("URL: "+request.getRequestURL());
-            out.println("Liste des Controllers:");
-            if (ls.isEmpty()) {
-                out.println("La liste est vide.");
+            String requestedPath = request.getPathInfo();
+
+            Mapping mapping = urlMappings.get(requestedPath);
+            if (mapping == null) {
+                mapping = unannotatedMethods.get(requestedPath);
             }
-            for (int i = 0; i < ls.size(); i++) {
-                out.println((i+1)+": "+ls.get(i));
+
+            if (mapping != null) {
+                out.println("Requested URL Path: " + requestedPath);
+                out.println("Mapped to Class: " + mapping.getClassName());
+                out.println("Mapped to Method: " + mapping.getMethodName());
+                
+                try {
+                    // Load the class
+                    Class<?> clazz = Class.forName(mapping.getClassName());
+
+                    // Create an instance of the class
+                    Object instance = clazz.getDeclaredConstructor().newInstance();
+
+                    // Get the method to invoke
+                    Method method = clazz.getDeclaredMethod(mapping.getMethodName());
+
+                    // Invoke the method and get the result
+                    Object result = method.invoke(instance);
+
+                    // Print the result
+                    out.println("Result from invoked method: " + result);
+                } catch (ClassNotFoundException | NoSuchMethodException | InstantiationException | IllegalAccessException | InvocationTargetException e) {
+                    out.println("Error while invoking method: " + e.getMessage());
+                    e.printStackTrace(out);
+                }
+            } else {
+                out.println("No method associated with the path: " + requestedPath);
             }
         }
     }
@@ -80,18 +75,61 @@ public class FrontController extends HttpServlet{
     @Override
     protected void doGet(HttpServletRequest request, HttpServletResponse response)
             throws ServletException, IOException {
-       processRequest(request, response);
+        processRequest(request, response);
     }
 
     @Override
     protected void doPost(HttpServletRequest request, HttpServletResponse response)
             throws ServletException, IOException {
-       processRequest(request, response);
+        processRequest(request, response);
     }
 
     @Override
     public String getServletInfo() {
-        return "Short description";
-    }// </editor-fold>
+        return "FrontServlet";
+    }
 
+    private void scanControllersAndMapUrls(String packageName) {
+        List<Class<?>> controllerClasses = scanControllers(packageName);
+        for (Class<?> controllerClass : controllerClasses) {
+            Method[] methods = controllerClass.getDeclaredMethods();
+            for (Method method : methods) {
+                if (method.isAnnotationPresent(GET.class)) {
+                    GET getAnnotation = method.getAnnotation(GET.class);
+                    String urlPath = getAnnotation.value();
+                    urlMappings.put(urlPath, new Mapping(controllerClass.getName(), method.getName()));
+                } else {
+                    // Assume the method name will be used as a URL path for unannotated methods
+                    String urlPath = "/" + method.getName();
+                    unannotatedMethods.put(urlPath, new Mapping(controllerClass.getName(), method.getName()));
+                }
+            }
+        }
+    }
+
+    public static List<Class<?>> scanControllers(String packageName) {
+        List<Class<?>> controllerClasses = new ArrayList<>();
+        try {
+            ClassLoader classLoader = FrontServlet.class.getClassLoader();
+            String packagePath = packageName.replace('.', '/');
+            java.net.URL resource = classLoader.getResource(packagePath);
+            if (resource != null) {
+                Path packageDirectory = Paths.get(resource.toURI());
+                List<String> classNames = Files.walk(packageDirectory)
+                        .filter(Files::isRegularFile)
+                        .filter(file -> file.getFileName().toString().endsWith(".class"))
+                        .map(file -> packageName + "." + file.getFileName().toString().replace(".class", ""))
+                        .collect(Collectors.toList());
+                for (String className : classNames) {
+                    Class<?> clazz = Class.forName(className);
+                    if (clazz.isAnnotationPresent(ControllerAnnotation.class)) {
+                        controllerClasses.add(clazz);
+                    }
+                }
+            }
+        } catch (URISyntaxException | IOException | ClassNotFoundException e) {
+            e.printStackTrace();
+        }
+        return controllerClasses;
+    }
 }
